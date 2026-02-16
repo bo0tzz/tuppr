@@ -4,6 +4,7 @@ package e2ehetzner
 
 import (
 	"context"
+	"log"
 	"testing"
 	"time"
 
@@ -14,8 +15,6 @@ import (
 var (
 	cfg     *Config
 	cluster *HetznerCluster
-	testCtx context.Context
-	cancel  context.CancelFunc
 )
 
 func TestE2EHetzner(t *testing.T) {
@@ -23,9 +22,10 @@ func TestE2EHetzner(t *testing.T) {
 	RunSpecs(t, "E2E Hetzner Suite")
 }
 
-var _ = BeforeSuite(func() {
-	testCtx, cancel = context.WithTimeout(context.Background(), 40*time.Minute)
-
+// BeforeSuite accepts SpecContext which is automatically cancelled by Ginkgo on
+// interrupt (ctrl+c). This ensures all in-flight API calls and SSH sessions
+// are terminated promptly so DeferCleanup can run Destroy.
+var _ = BeforeSuite(func(ctx SpecContext) {
 	var err error
 
 	By("Loading configuration")
@@ -38,34 +38,27 @@ var _ = BeforeSuite(func() {
 	By("Creating Hetzner cluster")
 	cluster = NewHetznerCluster(cfg)
 
-	// Ensure cleanup runs even if Create fails partway through
+	// Ensure cleanup runs even if Create fails partway through.
+	// Uses a fresh context since the spec context will be cancelled by then.
 	DeferCleanup(func() {
 		if cluster == nil {
 			return
 		}
-		By("Destroying Hetzner cluster")
-		// Use a fresh context for cleanup in case the test context was cancelled
+		log.Println("[hetzner] cleaning up Hetzner resources...")
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cleanupCancel()
-		err := cluster.Destroy(cleanupCtx)
-		if err != nil {
-			GinkgoWriter.Printf("WARNING: cleanup failed: %v\n", err)
+		if err := cluster.Destroy(cleanupCtx); err != nil {
+			log.Printf("[hetzner] WARNING: cleanup failed: %v", err)
 		}
 	})
 
-	Expect(cluster.Create(testCtx)).To(Succeed())
+	Expect(cluster.Create(ctx)).To(Succeed())
 
 	By("Cluster created successfully")
 	for i, ip := range cluster.ServerIPs() {
-		GinkgoWriter.Printf("  Node %d: %s\n", i, ip)
+		log.Printf("[hetzner] node %d: %s", i, ip)
 	}
-})
-
-var _ = AfterSuite(func() {
-	if cancel != nil {
-		cancel()
-	}
-})
+}, NodeTimeout(40*time.Minute))
 
 var _ = Describe("Infrastructure", Ordered, func() {
 	It("should have created 3 servers with public IPs", func() {
@@ -74,7 +67,7 @@ var _ = Describe("Infrastructure", Ordered, func() {
 		Expect(ips).To(HaveLen(3))
 		for i, ip := range ips {
 			Expect(ip).NotTo(BeEmpty(), "server %d has no IP", i)
-			GinkgoWriter.Printf("Server %d IP: %s\n", i, ip)
+			log.Printf("Server %d IP: %s", i, ip)
 		}
 	})
 })

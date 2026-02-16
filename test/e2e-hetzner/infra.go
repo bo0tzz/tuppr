@@ -59,12 +59,9 @@ func (h *HetznerCluster) Create(ctx context.Context) error {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			server, err := h.createAndFlashServer(ctx, idx)
-			if err != nil {
+			if err := h.createAndFlashServer(ctx, idx); err != nil {
 				errs[idx] = fmt.Errorf("server %d: %w", idx, err)
-				return
 			}
-			h.servers[idx] = server
 		}(i)
 	}
 	wg.Wait()
@@ -145,7 +142,7 @@ func (h *HetznerCluster) logf(format string, args ...any) {
 	log.Printf("[hetzner] "+format, args...)
 }
 
-func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*hcloud.Server, error) {
+func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) error {
 	name := fmt.Sprintf("%s-node-%d", h.RunID, index)
 
 	h.logf("%s: creating server (type=%s, location=%s)", name, h.config.ServerType, h.config.Location)
@@ -160,20 +157,23 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*
 		Labels:     h.labels(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("creating server %s: %w", name, err)
+		return fmt.Errorf("creating server %s: %w", name, err)
 	}
 
 	server := result.Server
+	// Store reference immediately so Destroy can clean up even if flash is interrupted
+	h.servers[index] = server
+
 	ip := server.PublicNet.IPv4.IP.String()
 	h.logf("%s: server created (ip=%s), waiting for actions", name, ip)
 
 	// Wait for creation action to complete
 	if err := h.client.Action.WaitFor(ctx, result.Action); err != nil {
-		return nil, fmt.Errorf("waiting for server %s creation: %w", name, err)
+		return fmt.Errorf("waiting for server %s creation: %w", name, err)
 	}
 	for _, a := range result.NextActions {
 		if err := h.client.Action.WaitFor(ctx, a); err != nil {
-			return nil, fmt.Errorf("waiting for server %s next action: %w", name, err)
+			return fmt.Errorf("waiting for server %s next action: %w", name, err)
 		}
 	}
 
@@ -183,42 +183,42 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*
 		SSHKeys: []*hcloud.SSHKey{h.sshKey},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("enabling rescue on %s: %w", name, err)
+		return fmt.Errorf("enabling rescue on %s: %w", name, err)
 	}
 	if err := h.client.Action.WaitFor(ctx, rescueResult.Action); err != nil {
-		return nil, fmt.Errorf("waiting for rescue enable on %s: %w", name, err)
+		return fmt.Errorf("waiting for rescue enable on %s: %w", name, err)
 	}
 
 	h.logf("%s: resetting server to boot into rescue", name)
 	resetAction, _, err := h.client.Server.Reset(ctx, server)
 	if err != nil {
-		return nil, fmt.Errorf("resetting %s for rescue: %w", name, err)
+		return fmt.Errorf("resetting %s for rescue: %w", name, err)
 	}
 	if err := h.client.Action.WaitFor(ctx, resetAction); err != nil {
-		return nil, fmt.Errorf("waiting for reset on %s: %w", name, err)
+		return fmt.Errorf("waiting for reset on %s: %w", name, err)
 	}
 
 	h.logf("%s: waiting for SSH on %s", name, ip)
 	if err := h.waitForSSH(ctx, ip); err != nil {
-		return nil, fmt.Errorf("waiting for SSH on %s (%s): %w", name, ip, err)
+		return fmt.Errorf("waiting for SSH on %s (%s): %w", name, ip, err)
 	}
 
 	h.logf("%s: flashing Talos %s (this takes 2-5 minutes)", name, h.config.TalosFromVersion)
 	if err := h.flashTalos(ctx, ip); err != nil {
-		return nil, fmt.Errorf("flashing Talos on %s (%s): %w", name, ip, err)
+		return fmt.Errorf("flashing Talos on %s (%s): %w", name, ip, err)
 	}
 
 	h.logf("%s: flash complete, rebooting into Talos", name)
 	rebootAction, _, err := h.client.Server.Reset(ctx, server)
 	if err != nil {
-		return nil, fmt.Errorf("rebooting %s into Talos: %w", name, err)
+		return fmt.Errorf("rebooting %s into Talos: %w", name, err)
 	}
 	if err := h.client.Action.WaitFor(ctx, rebootAction); err != nil {
-		return nil, fmt.Errorf("waiting for Talos reboot on %s: %w", name, err)
+		return fmt.Errorf("waiting for Talos reboot on %s: %w", name, err)
 	}
 
 	h.logf("%s: ready (ip=%s)", name, ip)
-	return server, nil
+	return nil
 }
 
 func (h *HetznerCluster) waitForSSH(ctx context.Context, ip string) error {
