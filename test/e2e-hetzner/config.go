@@ -23,7 +23,7 @@ type Config struct {
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
 		HCloudToken:      os.Getenv("HCLOUD_TOKEN"),
-		ServerType:       envOrDefault("HCLOUD_SERVER_TYPE", "cx22"),
+		ServerType:       envOrDefault("HCLOUD_SERVER_TYPE", "cx23"),
 		Location:         envOrDefault("HCLOUD_LOCATION", "fsn1"),
 		TalosFromVersion: envOrDefault("TALOS_FROM_VERSION", "v1.11.0"),
 		TalosToVersion:   envOrDefault("TALOS_TO_VERSION", "v1.12.4"),
