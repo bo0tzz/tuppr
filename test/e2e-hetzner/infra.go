@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	ginkgo "github.com/onsi/ginkgo/v2"
+	"log"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	"golang.org/x/crypto/ssh"
@@ -142,7 +142,7 @@ func (h *HetznerCluster) createSSHKey(ctx context.Context) error {
 }
 
 func (h *HetznerCluster) logf(format string, args ...any) {
-	fmt.Fprintf(ginkgo.GinkgoWriter, "[hetzner] "+format+"\n", args...)
+	log.Printf("[hetzner] "+format, args...)
 }
 
 func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*hcloud.Server, error) {
