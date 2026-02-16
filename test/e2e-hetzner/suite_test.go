@@ -13,8 +13,9 @@ import (
 )
 
 var (
-	cfg     *Config
-	cluster *HetznerCluster
+	cfg          *Config
+	cluster      *HetznerCluster
+	talosCluster *TalosCluster
 )
 
 func TestE2EHetzner(t *testing.T) {
@@ -58,6 +59,23 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	for i, ip := range cluster.ServerIPs() {
 		log.Printf("[hetzner] node %d: %s", i, ip)
 	}
+
+	By("Bootstrapping Talos cluster")
+	var err2 error
+	talosCluster, err2 = NewTalosCluster(cluster.RunID, cfg.TalosFromVersion, cfg.K8sFromVersion, cluster.ServerIPs())
+	Expect(err2).NotTo(HaveOccurred())
+
+	DeferCleanup(func() {
+		if talosCluster != nil {
+			talosCluster.Cleanup()
+		}
+	})
+
+	Expect(talosCluster.Bootstrap(ctx)).To(Succeed())
+
+	By("Talos cluster bootstrapped successfully")
+	log.Printf("[talos] kubeconfig: %s", talosCluster.Kubeconfig)
+	log.Printf("[talos] talosconfig: %s", talosCluster.TalosConfig)
 }, NodeTimeout(40*time.Minute))
 
 var _ = Describe("Infrastructure", Ordered, func() {

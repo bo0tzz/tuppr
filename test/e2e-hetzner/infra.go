@@ -203,7 +203,7 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) er
 		return fmt.Errorf("waiting for SSH on %s (%s): %w", name, ip, err)
 	}
 
-	h.logf("%s: flashing Talos %s (this takes 2-5 minutes)", name, h.config.TalosFromVersion)
+	h.logf("%s: flashing Talos %s", name, h.config.TalosFromVersion)
 	if err := h.flashTalos(ctx, ip); err != nil {
 		return fmt.Errorf("flashing Talos on %s (%s): %w", name, ip, err)
 	}
@@ -273,7 +273,7 @@ func (h *HetznerCluster) flashTalos(ctx context.Context, ip string) error {
 	defer session.Close()
 
 	imageURL := fmt.Sprintf(
-		"https://factory.talos.dev/image/%s/%s/hcloud-amd64.raw.xz",
+		"https://factory.talos.dev/image/%s/%s/nocloud-amd64.raw.xz",
 		defaultSchematicID,
 		h.config.TalosFromVersion,
 	)

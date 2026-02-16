@@ -15,6 +15,7 @@ type Config struct {
 	Location         string
 	TalosFromVersion string
 	TalosToVersion   string
+	K8sFromVersion   string
 	K8sToVersion     string
 	ControllerImage  string // if set, skip build and use this image
 }
@@ -27,7 +28,8 @@ func LoadConfig() (*Config, error) {
 		Location:         envOrDefault("HCLOUD_LOCATION", "nbg1"),
 		TalosFromVersion: envOrDefault("TALOS_FROM_VERSION", "v1.11.0"),
 		TalosToVersion:   envOrDefault("TALOS_TO_VERSION", "v1.12.4"),
-		K8sToVersion:     envOrDefault("K8S_TO_VERSION", "v1.34.0"),
+		K8sFromVersion:   envOrDefault("K8S_FROM_VERSION", "v1.34.0"),
+		K8sToVersion:     envOrDefault("K8S_TO_VERSION", "v1.35.0"),
 		ControllerImage:  os.Getenv("CONTROLLER_IMAGE"),
 	}
 
