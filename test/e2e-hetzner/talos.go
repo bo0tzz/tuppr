@@ -13,12 +13,18 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
 	talosBootstrapTimeout = 10 * time.Minute
 	nodeReadyTimeout      = 10 * time.Minute
 	nodeReadyPollInterval = 10 * time.Second
+	dialTimeout           = 5 * time.Second
 )
 
 // TalosCluster manages a Talos Linux cluster bootstrapped via talosctl.
@@ -66,7 +72,7 @@ func (tc *TalosCluster) Bootstrap(ctx context.Context) error {
 	}
 
 	log.Printf("[talos] bootstrapping cluster on %s", tc.ServerIPs[0])
-	if err := tc.bootstrap(ctx); err != nil {
+	if err := tc.talosctlWithConfig(ctx, "bootstrap", "--nodes", tc.ServerIPs[0]); err != nil {
 		return fmt.Errorf("bootstrapping: %w", err)
 	}
 
@@ -87,16 +93,6 @@ func (tc *TalosCluster) Bootstrap(ctx context.Context) error {
 
 	log.Printf("[talos] cluster bootstrap complete")
 	return nil
-}
-
-// TalosConfigData returns the raw talosconfig content for creating a K8s Secret.
-func (tc *TalosCluster) TalosConfigData() ([]byte, error) {
-	return os.ReadFile(tc.TalosConfig)
-}
-
-// KubeconfigData returns the raw kubeconfig content.
-func (tc *TalosCluster) KubeconfigData() ([]byte, error) {
-	return os.ReadFile(tc.Kubeconfig)
 }
 
 // Cleanup removes the temporary config directory.
@@ -187,13 +183,6 @@ func (tc *TalosCluster) applyConfig(ctx context.Context, index int, ip string) e
 	)
 }
 
-func (tc *TalosCluster) bootstrap(ctx context.Context) error {
-	return tc.talosctlWithConfig(ctx,
-		"bootstrap",
-		"--nodes", tc.ServerIPs[0],
-	)
-}
-
 func (tc *TalosCluster) waitForKubernetesReady(ctx context.Context) error {
 	deadline, cancel := context.WithTimeout(ctx, talosBootstrapTimeout)
 	defer cancel()
@@ -234,7 +223,7 @@ func (tc *TalosCluster) waitForTalosAPI(ctx context.Context, ip string) error {
 		case <-deadline:
 			return fmt.Errorf("Talos API not available at %s:50000 after %v", ip, connectTimeout)
 		case <-time.After(retryInterval):
-			conn, err := net.DialTimeout("tcp", ip+":50000", 5*time.Second)
+			conn, err := net.DialTimeout("tcp", ip+":50000", dialTimeout)
 			if err == nil {
 				conn.Close()
 				return nil
@@ -265,21 +254,30 @@ func (tc *TalosCluster) waitForNodesReady(ctx context.Context) error {
 }
 
 func (tc *TalosCluster) allNodesReady(ctx context.Context) (bool, error) {
-	cmd := exec.CommandContext(ctx, "kubectl",
-		"--kubeconfig", tc.Kubeconfig,
-		"get", "nodes",
-		"-o", "jsonpath={.items[*].status.conditions[?(@.type==\"Ready\")].status}",
-	)
-	out, err := cmd.Output()
+	restCfg, err := clientcmd.BuildConfigFromFlags("", tc.Kubeconfig)
 	if err != nil {
 		return false, err
 	}
-	statuses := strings.Fields(string(out))
-	if len(statuses) < len(tc.ServerIPs) {
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return false, err
+	}
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, err
+	}
+	if len(nodes.Items) < len(tc.ServerIPs) {
 		return false, nil
 	}
-	for _, s := range statuses {
-		if s != "True" {
+	for _, node := range nodes.Items {
+		ready := false
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
 			return false, nil
 		}
 	}

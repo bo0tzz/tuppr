@@ -8,14 +8,17 @@ import (
 	"testing"
 	"time"
 
+	tupprv1alpha1 "github.com/home-operations/tuppr/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
 	cfg          *Config
 	cluster      *HetznerCluster
 	talosCluster *TalosCluster
+	k8sClient    client.WithWatch
 
 	// bgCtx is a long-lived context for background goroutines (log streaming,
 	// resource watches) that must outlive the BeforeSuite SpecContext.
@@ -92,6 +95,10 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	log.Printf("[talos] kubeconfig: %s", talosCluster.Kubeconfig)
 	log.Printf("[talos] talosconfig: %s", talosCluster.TalosConfig)
 
+	By("Creating Kubernetes client")
+	k8sClient, err = newK8sClient(talosCluster.Kubeconfig)
+	Expect(err).NotTo(HaveOccurred())
+
 	By("Waiting for controller image build to finish")
 	imgRes := <-imageCh
 	Expect(imgRes.err).NotTo(HaveOccurred(), "building controller image")
@@ -99,18 +106,16 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	log.Printf("[deploy] image: %s", image)
 
 	By("Deploying controller via Helm")
-	talosConfigData, err4 := talosCluster.TalosConfigData()
-	Expect(err4).NotTo(HaveOccurred())
-	Expect(DeployController(ctx, talosCluster.Kubeconfig, image, talosConfigData)).To(Succeed())
+	Expect(DeployController(ctx, k8sClient, talosCluster.Kubeconfig, image)).To(Succeed())
 
 	By("Waiting for controller to be ready")
-	Expect(WaitForController(ctx, talosCluster.Kubeconfig)).To(Succeed())
+	Expect(WaitForController(ctx, k8sClient)).To(Succeed())
 	log.Printf("[deploy] controller is ready")
 
 	By("Starting background log streaming")
 	bgCtx, bgCancel = context.WithCancel(context.Background())
 	DeferCleanup(bgCancel)
 	streamLogs(bgCtx, talosCluster.Kubeconfig, controllerNamespace, "tuppr", "[tuppr]")
-	watchResource(bgCtx, talosCluster.Kubeconfig, "talosupgrade", "[watch/talosupgrade]")
-	watchResource(bgCtx, talosCluster.Kubeconfig, "kubernetesupgrade", "[watch/k8supgrade]")
+	watchResource(bgCtx, k8sClient, &tupprv1alpha1.TalosUpgradeList{}, "[watch/talosupgrade]")
+	watchResource(bgCtx, k8sClient, &tupprv1alpha1.KubernetesUpgradeList{}, "[watch/k8supgrade]")
 }, NodeTimeout(40*time.Minute))

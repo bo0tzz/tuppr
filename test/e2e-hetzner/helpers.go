@@ -10,78 +10,18 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
-
-// kubectlOutput runs kubectl and returns stdout.
-func kubectlOutput(ctx context.Context, kubeconfig string, args ...string) (string, error) {
-	fullArgs := append([]string{"--kubeconfig", kubeconfig}, args...)
-	cmd := exec.CommandContext(ctx, "kubectl", fullArgs...)
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("kubectl %s: %w\nstderr: %s", args[0], err, string(ee.Stderr))
-		}
-		return "", fmt.Errorf("kubectl %s: %w", args[0], err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// kubectlApply applies a YAML manifest via kubectl.
-func kubectlApply(ctx context.Context, kubeconfig string, yaml string) error {
-	cmd := exec.CommandContext(ctx, "kubectl",
-		"--kubeconfig", kubeconfig,
-		"apply", "-f", "-",
-	)
-	cmd.Stdin = strings.NewReader(yaml)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("kubectl apply: %w\n%s", err, string(out))
-	}
-	log.Printf("[kubectl] %s", strings.TrimSpace(string(out)))
-	return nil
-}
-
-// kubectlDelete deletes a resource via kubectl (ignores not-found errors).
-func kubectlDelete(ctx context.Context, kubeconfig string, resource, name string) error {
-	_, err := kubectlOutput(ctx, kubeconfig,
-		"delete", resource, name, "--ignore-not-found",
-	)
-	return err
-}
-
-// getCRStatus fetches a CR's status using kubectl and returns it as a map.
-func getCRStatus(ctx context.Context, kubeconfig string, resource, name string) (map[string]any, error) {
-	out, err := kubectlOutput(ctx, kubeconfig,
-		"get", resource, name,
-		"-o", "jsonpath={.status}",
-	)
-	if err != nil {
-		return nil, err
-	}
-	if out == "" {
-		return nil, nil
-	}
-	var status map[string]any
-	if err := json.Unmarshal([]byte(out), &status); err != nil {
-		return nil, fmt.Errorf("parsing status JSON: %w\nraw: %s", err, out)
-	}
-	return status, nil
-}
-
-// getCRPhase returns the .status.phase of a CR.
-func getCRPhase(ctx context.Context, kubeconfig string, resource, name string) (string, error) {
-	return kubectlOutput(ctx, kubeconfig,
-		"get", resource, name,
-		"-o", "jsonpath={.status.phase}",
-	)
-}
 
 // talosctlOutput runs talosctl with the given talosconfig and returns stdout.
 func talosctlOutput(ctx context.Context, talosconfig string, args ...string) (string, error) {
@@ -100,12 +40,18 @@ func talosctlOutput(ctx context.Context, talosconfig string, args ...string) (st
 	return strings.TrimSpace(string(out)), nil
 }
 
-// streamLogs starts streaming kubectl logs for a deployment in the background.
-// Automatically restarts if the connection drops (e.g. during node upgrades).
+// streamLogs watches for pods matching a deployment's selector and streams logs
+// from every pod. New pods (e.g. after leader election changes) are picked up
+// automatically. Restarts the pod watcher if it disconnects.
 func streamLogs(ctx context.Context, kubeconfig, namespace, deployment, prefix string) {
 	go func() {
 		for ctx.Err() == nil {
-			runStreamLogs(ctx, kubeconfig, namespace, deployment, prefix)
+			if err := runStreamLogs(ctx, kubeconfig, namespace, deployment, prefix); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("%s stream error: %v", prefix, err)
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -116,36 +62,133 @@ func streamLogs(ctx context.Context, kubeconfig, namespace, deployment, prefix s
 	}()
 }
 
-func runStreamLogs(ctx context.Context, kubeconfig, namespace, deployment, prefix string) {
-	cmd := exec.CommandContext(ctx, "kubectl",
-		"--kubeconfig", kubeconfig,
-		"--namespace", namespace,
-		"logs", fmt.Sprintf("deployment/%s", deployment),
-		"--follow", "--tail=0",
-	)
-	stdout, err := cmd.StdoutPipe()
+func runStreamLogs(ctx context.Context, kubeconfig, namespace, deployment, prefix string) error {
+	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		log.Printf("%s failed to create pipe: %v", prefix, err)
-		return
+		return fmt.Errorf("building rest config: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
-		log.Printf("%s failed to start: %v", prefix, err)
-		return
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return fmt.Errorf("creating clientset: %w", err)
 	}
+
+	dep, err := clientset.AppsV1().Deployments(namespace).Get(ctx, deployment, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("getting deployment: %w", err)
+	}
+
+	selector := labelSelector(dep.Spec.Selector.MatchLabels)
+
+	// Track which pods we're already streaming so we don't double-stream.
+	var mu sync.Mutex
+	streaming := map[string]context.CancelFunc{}
+
+	startStream := func(pod corev1.Pod) {
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := streaming[pod.Name]; ok {
+			return
+		}
+		podCtx, podCancel := context.WithCancel(ctx)
+		streaming[pod.Name] = podCancel
+		podPrefix := fmt.Sprintf("%s/%s", prefix, pod.Name)
+		go func() {
+			defer func() {
+				mu.Lock()
+				delete(streaming, pod.Name)
+				mu.Unlock()
+			}()
+			streamPodLogs(podCtx, clientset, namespace, pod.Name, podPrefix)
+		}()
+	}
+
+	stopStream := func(podName string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if cancel, ok := streaming[podName]; ok {
+			cancel()
+			delete(streaming, podName)
+		}
+	}
+
+	// Start streaming existing pods.
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return fmt.Errorf("listing pods: %w", err)
+	}
+	for _, pod := range pods.Items {
+		startStream(pod)
+	}
+
+	// Watch for new/deleted pods.
+	watcher, err := clientset.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+		ResourceVersion: pods.ResourceVersion,
+	})
+	if err != nil {
+		return fmt.Errorf("watching pods: %w", err)
+	}
+	defer watcher.Stop()
+
+	for event := range watcher.ResultChan() {
+		pod, ok := event.Object.(*corev1.Pod)
+		if !ok {
+			continue
+		}
+		switch event.Type {
+		case watch.Added, watch.Modified:
+			startStream(*pod)
+		case watch.Deleted:
+			stopStream(pod.Name)
+		}
+	}
+	return nil
+}
+
+func streamPodLogs(ctx context.Context, clientset kubernetes.Interface, namespace, podName, prefix string) {
 	log.Printf("%s streaming started", prefix)
-	scanner := bufio.NewScanner(stdout)
+	stream, err := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+		Follow:    true,
+		TailLines: ptr.To(int64(0)),
+	}).Stream(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("%s log stream error: %v", prefix, err)
+		}
+		return
+	}
+	defer stream.Close()
+
+	scanner := bufio.NewScanner(stream)
 	for scanner.Scan() {
 		log.Printf("%s %s", prefix, scanner.Text())
 	}
-	_ = cmd.Wait()
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
+		log.Printf("%s scanner error: %v", prefix, err)
+	}
 }
 
-// watchResource starts a background `kubectl get -w` for a resource type.
-// Automatically restarts if the connection drops (e.g. during node upgrades).
-func watchResource(ctx context.Context, kubeconfig, resource, prefix string) {
+func labelSelector(labels map[string]string) string {
+	var parts []string
+	for k, v := range labels {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	return strings.Join(parts, ",")
+}
+
+// watchResource starts a background watch for a resource type and logs all
+// events as raw JSON. Automatically restarts if the connection drops.
+func watchResource(ctx context.Context, c client.WithWatch, list client.ObjectList, prefix string) {
 	go func() {
 		for ctx.Err() == nil {
-			runWatch(ctx, kubeconfig, resource, prefix)
+			if err := runWatch(ctx, c, list, prefix); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("%s watch error: %v", prefix, err)
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -156,35 +199,56 @@ func watchResource(ctx context.Context, kubeconfig, resource, prefix string) {
 	}()
 }
 
-func runWatch(ctx context.Context, kubeconfig, resource, prefix string) {
-	cmd := exec.CommandContext(ctx, "kubectl",
-		"--kubeconfig", kubeconfig,
-		"get", resource,
-		"--watch", "--output-watch-events",
-		"-o", "json",
-	)
-	stdout, err := cmd.StdoutPipe()
+func runWatch(ctx context.Context, c client.WithWatch, list client.ObjectList, prefix string) error {
+	watcher, err := c.Watch(ctx, list)
 	if err != nil {
-		log.Printf("%s failed to create pipe: %v", prefix, err)
-		return
+		return fmt.Errorf("starting watch: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
-		log.Printf("%s failed to start: %v", prefix, err)
-		return
-	}
+	defer watcher.Stop()
+
 	log.Printf("%s watching started", prefix)
-	dec := json.NewDecoder(stdout)
-	for {
-		var event json.RawMessage
-		if err := dec.Decode(&event); err != nil {
-			if ctx.Err() == nil {
-				log.Printf("%s decode error: %v", prefix, err)
+	for event := range watcher.ResultChan() {
+		if event.Type == watch.Error {
+			// Watch terminated by API server (e.g. 410 Gone, context cancelled).
+			// This is normal during teardown or after long-running watches.
+			if ctx.Err() != nil {
+				return nil
 			}
-			break
+			log.Printf("%s watch terminated by server, will reconnect", prefix)
+			return nil
 		}
-		log.Printf("%s %s", prefix, event)
+		raw, err := json.Marshal(event.Object)
+		if err != nil {
+			log.Printf("%s %s (marshal error: %v)", prefix, event.Type, err)
+			continue
+		}
+		log.Printf("%s %s %s", prefix, event.Type, raw)
 	}
-	_ = cmd.Wait()
+	return nil
+}
+
+// waitForDeploymentReady polls until a deployment has all replicas ready.
+func waitForDeploymentReady(ctx context.Context, c client.Client, namespace, name string, timeout time.Duration) error {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline:
+			return fmt.Errorf("deployment %s/%s not ready after %v", namespace, name, timeout)
+		case <-time.After(10 * time.Second):
+			var dep appsv1.Deployment
+			if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &dep); err != nil {
+				log.Printf("[deploy] waiting for deployment %s: %v", name, err)
+				continue
+			}
+			if dep.Status.ReadyReplicas == *dep.Spec.Replicas {
+				return nil
+			}
+			log.Printf("[deploy] %s: %d/%d replicas ready",
+				name, dep.Status.ReadyReplicas, *dep.Spec.Replicas)
+		}
+	}
 }
 
 // getTalosNodeVersions returns a map of node IP -> Talos version string.
@@ -197,16 +261,15 @@ func getTalosNodeVersions(ctx context.Context, talosconfig string, nodeIPs []str
 		if err != nil {
 			return nil, fmt.Errorf("getting version for %s: %w", ip, err)
 		}
-		// talosctl version --short outputs two lines:
+		// talosctl version --short outputs:
 		//   Client:
 		//     Tag: v1.12.4
 		//   Server:
 		//     Tag: v1.11.0
-		// We want the server tag.
+		// We want the server tag (the last "Tag:" line).
 		for _, line := range strings.Split(out, "\n") {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "Tag:") {
-				// The second "Tag:" line is the server version
 				versions[ip] = strings.TrimSpace(strings.TrimPrefix(line, "Tag:"))
 			}
 		}

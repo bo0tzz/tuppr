@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -37,10 +38,14 @@ type HetznerCluster struct {
 
 // NewHetznerCluster creates a new cluster manager.
 func NewHetznerCluster(cfg *Config) *HetznerCluster {
+	runID := fmt.Sprintf("tuppr-e2e-%d", time.Now().Unix())
+	if ghaRunID := os.Getenv("GITHUB_RUN_ID"); ghaRunID != "" {
+		runID = fmt.Sprintf("tuppr-e2e-gha-%s", ghaRunID)
+	}
 	return &HetznerCluster{
 		client: hcloud.NewClient(hcloud.WithToken(cfg.HCloudToken)),
 		config: cfg,
-		RunID:  fmt.Sprintf("tuppr-e2e-%d", time.Now().Unix()),
+		RunID:  runID,
 	}
 }
 
@@ -227,11 +232,9 @@ func (h *HetznerCluster) waitForSSH(ctx context.Context, ip string) error {
 		case <-deadline:
 			return fmt.Errorf("SSH not available at %s after %v", ip, connectTimeout)
 		case <-time.After(retryInterval):
-			conn, err := net.DialTimeout("tcp", ip+":22", 5*time.Second)
+			conn, err := net.DialTimeout("tcp", ip+":22", dialTimeout)
 			if err == nil {
 				conn.Close()
-				// Give the SSH service a moment to fully initialize
-				time.Sleep(2 * time.Second)
 				return nil
 			}
 		}

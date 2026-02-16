@@ -11,17 +11,23 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/google/go-containerregistry/pkg/name"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/util/yaml"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
-	controllerNamespace = "tuppr-system"
-	helmReleaseName     = "tuppr"
+	controllerNamespace    = "tuppr-system"
+	helmReleaseName        = "tuppr"
 	controllerReadyTimeout = 5 * time.Minute
-	controllerPollInterval = 10 * time.Second
 )
 
 // BuildAndPushImage builds the controller image and pushes it to ttl.sh.
-// If cfg.ControllerImage is set, it returns that directly (skipping the build).
 func BuildAndPushImage(ctx context.Context, cfg *Config, runID string) (string, error) {
 	if cfg.ControllerImage != "" {
 		log.Printf("[deploy] using pre-built image: %s", cfg.ControllerImage)
@@ -31,7 +37,6 @@ func BuildAndPushImage(ctx context.Context, cfg *Config, runID string) (string, 
 	image := fmt.Sprintf("ttl.sh/tuppr-%s:2h", runID)
 	log.Printf("[deploy] building image: %s", image)
 
-	// Find the repo root (one level up from test/e2e-hetzner/)
 	repoRoot, err := repoRootDir()
 	if err != nil {
 		return "", err
@@ -62,48 +67,43 @@ func BuildAndPushImage(ctx context.Context, cfg *Config, runID string) (string, 
 	return image, nil
 }
 
-// DeployController installs the controller via Helm and creates the talosconfig secret.
-func DeployController(ctx context.Context, kubeconfig string, image string, talosConfigData []byte) error {
+// DeployController installs the controller via Helm.
+// CRDs are applied directly from config/crd/bases/, and the talosconfig
+// secret is auto-created by Talos via the ServiceAccount in the chart.
+func DeployController(ctx context.Context, c client.Client, kubeconfig, image string) error {
 	repoRoot, err := repoRootDir()
 	if err != nil {
 		return err
 	}
 
-	// Copy CRDs to chart dir (they're gitignored)
-	log.Printf("[deploy] copying CRDs to Helm chart")
-	crdSrc := filepath.Join(repoRoot, "config", "crd", "bases")
-	crdDst := filepath.Join(repoRoot, "charts", "tuppr", "crds")
-	if err := copyCRDs(crdSrc, crdDst); err != nil {
-		return fmt.Errorf("copying CRDs: %w", err)
+	log.Printf("[deploy] applying CRDs")
+	if err := applyCRDs(ctx, c, filepath.Join(repoRoot, "config", "crd", "bases")); err != nil {
+		return fmt.Errorf("applying CRDs: %w", err)
 	}
 
-	// Create namespace with pod security labels before Helm install
 	log.Printf("[deploy] creating namespace %s", controllerNamespace)
-	if err := kubectl(ctx, kubeconfig,
-		"create", "namespace", controllerNamespace,
-	); err != nil {
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: controllerNamespace,
+			Labels: map[string]string{
+				"pod-security.kubernetes.io/enforce": "privileged",
+				"pod-security.kubernetes.io/warn":    "privileged",
+			},
+		},
+	}
+	if err := c.Create(ctx, ns); err != nil {
 		return fmt.Errorf("creating namespace: %w", err)
 	}
-	if err := kubectl(ctx, kubeconfig,
-		"label", "namespace", controllerNamespace,
-		"pod-security.kubernetes.io/enforce=privileged",
-		"pod-security.kubernetes.io/warn=privileged",
-	); err != nil {
-		return fmt.Errorf("labeling namespace: %w", err)
-	}
 
-	// Create the talosconfig secret BEFORE helm install so the deployment
-	// can mount it immediately when pods start.
-	log.Printf("[deploy] creating talosconfig secret")
-	if err := createTalosConfigSecret(ctx, kubeconfig, talosConfigData); err != nil {
-		return fmt.Errorf("creating talosconfig secret: %w", err)
+	ref, err := name.ParseReference(image)
+	if err != nil {
+		return fmt.Errorf("parsing image reference %q: %w", image, err)
 	}
-
-	// Split image into repository:tag
-	repo, tag := splitImage(image)
+	repo := ref.Context().String()
+	tag := ref.Identifier()
 
 	chartPath := filepath.Join(repoRoot, "charts", "tuppr")
-	log.Printf("[deploy] helm install %s (image=%s)", helmReleaseName, image)
+	log.Printf("[deploy] helm install %s (repo=%s, tag=%s)", helmReleaseName, repo, tag)
 
 	helmArgs := []string{
 		"install", helmReleaseName, chartPath,
@@ -131,94 +131,37 @@ func DeployController(ctx context.Context, kubeconfig string, image string, talo
 	return nil
 }
 
-// WaitForController waits for the controller pod to be ready.
-func WaitForController(ctx context.Context, kubeconfig string) error {
-	deadline := time.After(controllerReadyTimeout)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline:
-			return fmt.Errorf("controller not ready after %v", controllerReadyTimeout)
-		case <-time.After(controllerPollInterval):
-			cmd := exec.CommandContext(ctx, "kubectl",
-				"--kubeconfig", kubeconfig,
-				"--namespace", controllerNamespace,
-				"rollout", "status", "deployment/tuppr",
-				"--timeout=5s",
-			)
-			if err := cmd.Run(); err == nil {
-				return nil
-			}
-		}
-	}
+// WaitForController waits for the controller deployment to be fully ready.
+func WaitForController(ctx context.Context, c client.Client) error {
+	return waitForDeploymentReady(ctx, c, controllerNamespace, "tuppr", controllerReadyTimeout)
 }
 
-func createTalosConfigSecret(ctx context.Context, kubeconfig string, data []byte) error {
-	// The chart mounts a secret named <sa-name>-talosconfig.
-	// With default naming, the SA is "tuppr", so the secret is "tuppr-talosconfig".
-	secretName := "tuppr-talosconfig"
-
-	cmd := exec.CommandContext(ctx, "kubectl",
-		"--kubeconfig", kubeconfig,
-		"--namespace", controllerNamespace,
-		"create", "secret", "generic", secretName,
-		fmt.Sprintf("--from-literal=config=%s", string(data)),
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func copyCRDs(srcDir, dstDir string) error {
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(srcDir)
+func applyCRDs(ctx context.Context, c client.Client, crdDir string) error {
+	entries, err := os.ReadDir(crdDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("reading CRD dir: %w", err)
 	}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
+		data, err := os.ReadFile(filepath.Join(crdDir, e.Name()))
 		if err != nil {
-			return err
+			return fmt.Errorf("reading %s: %w", e.Name(), err)
 		}
-		if err := os.WriteFile(filepath.Join(dstDir, e.Name()), data, 0o644); err != nil {
-			return err
+		crd := &apiextensionsv1.CustomResourceDefinition{}
+		if err := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(data)), len(data)).Decode(crd); err != nil {
+			return fmt.Errorf("decoding %s: %w", e.Name(), err)
 		}
-	}
-	return nil
-}
-
-func splitImage(image string) (repo, tag string) {
-	// Handle ttl.sh/tuppr-xxx:2h or ghcr.io/org/repo:tag
-	if idx := strings.LastIndex(image, ":"); idx != -1 {
-		return image[:idx], image[idx+1:]
-	}
-	return image, "latest"
-}
-
-func kubectl(ctx context.Context, kubeconfig string, args ...string) error {
-	fullArgs := append([]string{"--kubeconfig", kubeconfig}, args...)
-	log.Printf("[deploy] kubectl %s", strings.Join(fullArgs, " "))
-	cmd := exec.CommandContext(ctx, "kubectl", fullArgs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		log.Printf("[deploy] applying CRD %s", crd.Name)
+		if err := c.Create(ctx, crd); err != nil {
+			return fmt.Errorf("creating CRD %s: %w", crd.Name, err)
 		}
-		return fmt.Errorf("kubectl %s: %w", args[0], err)
 	}
 	return nil
 }
 
 func repoRootDir() (string, error) {
-	// We're in test/e2e-hetzner/, so repo root is two levels up.
-	// Use git to find it reliably.
 	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
 	if err != nil {
 		return "", fmt.Errorf("finding repo root: %w", err)

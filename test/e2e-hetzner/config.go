@@ -42,7 +42,7 @@ func LoadConfig() (*Config, error) {
 
 // CheckPrerequisites verifies that all required CLI tools are available.
 func CheckPrerequisites() error {
-	tools := []string{"talosctl", "kubectl", "helm", "docker"}
+	tools := []string{"talosctl", "helm", "docker"}
 	for _, tool := range tools {
 		if _, err := exec.LookPath(tool); err != nil {
 			return fmt.Errorf("required tool %q not found in PATH", tool)

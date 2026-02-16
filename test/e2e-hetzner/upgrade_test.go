@@ -3,13 +3,23 @@
 package e2ehetzner
 
 import (
-	"fmt"
 	"log"
-	"strings"
 	"time"
 
+	tupprv1alpha1 "github.com/home-operations/tuppr/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	talosUpgradeTimeout = 20 * time.Minute
+	k8sUpgradeTimeout   = 15 * time.Minute
+	phaseStartTimeout   = 2 * time.Minute
+	phasePollInterval   = 10 * time.Second
+	upgradePollInterval = 30 * time.Second
 )
 
 // Upgrades run in a single Ordered container to ensure TalosUpgrade completes
@@ -26,35 +36,31 @@ var _ = Describe("Upgrades", Ordered, func() {
 			}
 
 			By("Creating TalosUpgrade CR")
-			manifest := fmt.Sprintf(`apiVersion: tuppr.home-operations.com/v1alpha1
-kind: TalosUpgrade
-metadata:
-  name: e2e-talos-upgrade
-spec:
-  talos:
-    version: %q
-  policy:
-    debug: true
-    rebootMode: default
-`, cfg.TalosToVersion)
-			Expect(kubectlApply(ctx, talosCluster.Kubeconfig, manifest)).To(Succeed())
+			upgrade := &tupprv1alpha1.TalosUpgrade{
+				ObjectMeta: metav1.ObjectMeta{Name: "e2e-talos-upgrade"},
+				Spec: tupprv1alpha1.TalosUpgradeSpec{
+					Talos:  tupprv1alpha1.TalosSpec{Version: cfg.TalosToVersion},
+					Policy: tupprv1alpha1.PolicySpec{Debug: true, RebootMode: "default"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, upgrade)).To(Succeed())
 
 			By("Waiting for TalosUpgrade to start")
 			Eventually(func(g Gomega) {
-				phase, err := getCRPhase(ctx, talosCluster.Kubeconfig, "talosupgrade", "e2e-talos-upgrade")
-				g.Expect(err).NotTo(HaveOccurred())
-				log.Printf("[talos-upgrade] phase: %s", phase)
-				g.Expect(phase).To(Or(Equal("InProgress"), Equal("Completed")))
-			}, 2*time.Minute, 10*time.Second).Should(Succeed())
+				var tu tupprv1alpha1.TalosUpgrade
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(upgrade), &tu)).To(Succeed())
+				log.Printf("[talos-upgrade] phase: %s", tu.Status.Phase)
+				g.Expect(tu.Status.Phase).To(Or(Equal("InProgress"), Equal("Completed")))
+			}, phaseStartTimeout, phasePollInterval).Should(Succeed())
 
 			By("Waiting for TalosUpgrade to complete")
 			Eventually(func(g Gomega) {
-				phase, err := getCRPhase(ctx, talosCluster.Kubeconfig, "talosupgrade", "e2e-talos-upgrade")
-				g.Expect(err).NotTo(HaveOccurred())
-				log.Printf("[talos-upgrade] phase: %s", phase)
-				g.Expect(phase).NotTo(Equal("Failed"), "upgrade entered Failed phase ")
-				g.Expect(phase).To(Equal("Completed"))
-			}, 20*time.Minute, 30*time.Second).Should(Succeed())
+				var tu tupprv1alpha1.TalosUpgrade
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(upgrade), &tu)).To(Succeed())
+				log.Printf("[talos-upgrade] phase: %s", tu.Status.Phase)
+				g.Expect(tu.Status.Phase).NotTo(Equal("Failed"), "upgrade entered Failed phase")
+				g.Expect(tu.Status.Phase).To(Equal("Completed"))
+			}, talosUpgradeTimeout, upgradePollInterval).Should(Succeed())
 
 			By("Verifying all nodes are on the target Talos version")
 			versions, err = getTalosNodeVersions(ctx, talosCluster.TalosConfig, talosCluster.ServerIPs)
@@ -65,15 +71,10 @@ spec:
 			}
 
 			By("Verifying status details")
-			status, err := getCRStatus(ctx, talosCluster.Kubeconfig, "talosupgrade", "e2e-talos-upgrade")
-			Expect(err).NotTo(HaveOccurred())
-
-			completedNodes, ok := status["completedNodes"].([]any)
-			Expect(ok).To(BeTrue(), "completedNodes should be a list")
-			Expect(completedNodes).To(HaveLen(len(talosCluster.ServerIPs)), "all nodes should be completed")
-
-			failedNodes, _ := status["failedNodes"].([]any)
-			Expect(failedNodes).To(BeEmpty(), "no nodes should have failed")
+			var tu tupprv1alpha1.TalosUpgrade
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(upgrade), &tu)).To(Succeed())
+			Expect(tu.Status.CompletedNodes).To(HaveLen(len(talosCluster.ServerIPs)), "all nodes should be completed")
+			Expect(tu.Status.FailedNodes).To(BeEmpty(), "no nodes should have failed")
 
 			log.Printf("[talos-upgrade] upgrade completed successfully")
 		}, NodeTimeout(25*time.Minute))
@@ -81,61 +82,52 @@ spec:
 
 	Describe("KubernetesUpgrade", func() {
 		It("should upgrade Kubernetes to the target version", func(ctx SpecContext) {
-			By("Getting the current Kubernetes version")
-			currentVersion, err := kubectlOutput(ctx, talosCluster.Kubeconfig,
-				"version", "-o", "json",
-			)
-			Expect(err).NotTo(HaveOccurred())
-			log.Printf("[k8s-upgrade] current cluster version info:\n%s", currentVersion)
+			By("Getting the current Kubernetes version from nodes")
+			var nodes corev1.NodeList
+			Expect(k8sClient.List(ctx, &nodes)).To(Succeed())
+			for _, node := range nodes.Items {
+				log.Printf("[k8s-upgrade] node %s kubelet: %s", node.Name, node.Status.NodeInfo.KubeletVersion)
+			}
 
 			By("Creating KubernetesUpgrade CR")
-			manifest := fmt.Sprintf(`apiVersion: tuppr.home-operations.com/v1alpha1
-kind: KubernetesUpgrade
-metadata:
-  name: e2e-k8s-upgrade
-spec:
-  kubernetes:
-    version: %q
-`, cfg.K8sToVersion)
-			Expect(kubectlApply(ctx, talosCluster.Kubeconfig, manifest)).To(Succeed())
+			upgrade := &tupprv1alpha1.KubernetesUpgrade{
+				ObjectMeta: metav1.ObjectMeta{Name: "e2e-k8s-upgrade"},
+				Spec: tupprv1alpha1.KubernetesUpgradeSpec{
+					Kubernetes: tupprv1alpha1.KubernetesSpec{Version: cfg.K8sToVersion},
+				},
+			}
+			Expect(k8sClient.Create(ctx, upgrade)).To(Succeed())
 
 			By("Waiting for KubernetesUpgrade to start")
 			Eventually(func(g Gomega) {
-				phase, err := getCRPhase(ctx, talosCluster.Kubeconfig, "kubernetesupgrade", "e2e-k8s-upgrade")
-				g.Expect(err).NotTo(HaveOccurred())
-				log.Printf("[k8s-upgrade] phase: %s", phase)
-				g.Expect(phase).To(Or(Equal("InProgress"), Equal("Completed")))
-			}, 2*time.Minute, 10*time.Second).Should(Succeed())
+				var ku tupprv1alpha1.KubernetesUpgrade
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(upgrade), &ku)).To(Succeed())
+				log.Printf("[k8s-upgrade] phase: %s", ku.Status.Phase)
+				g.Expect(ku.Status.Phase).To(Or(Equal("InProgress"), Equal("Completed")))
+			}, phaseStartTimeout, phasePollInterval).Should(Succeed())
 
 			By("Waiting for KubernetesUpgrade to complete")
 			Eventually(func(g Gomega) {
-				phase, err := getCRPhase(ctx, talosCluster.Kubeconfig, "kubernetesupgrade", "e2e-k8s-upgrade")
-				g.Expect(err).NotTo(HaveOccurred())
-				log.Printf("[k8s-upgrade] phase: %s", phase)
-				g.Expect(phase).NotTo(Equal("Failed"), "upgrade entered Failed phase ")
-				g.Expect(phase).To(Equal("Completed"))
-			}, 15*time.Minute, 30*time.Second).Should(Succeed())
+				var ku tupprv1alpha1.KubernetesUpgrade
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(upgrade), &ku)).To(Succeed())
+				log.Printf("[k8s-upgrade] phase: %s", ku.Status.Phase)
+				g.Expect(ku.Status.Phase).NotTo(Equal("Failed"), "upgrade entered Failed phase")
+				g.Expect(ku.Status.Phase).To(Equal("Completed"))
+			}, k8sUpgradeTimeout, upgradePollInterval).Should(Succeed())
 
 			By("Verifying Kubernetes version on all nodes")
-			nodesVersion, err := kubectlOutput(ctx, talosCluster.Kubeconfig,
-				"get", "nodes",
-				"-o", "jsonpath={.items[*].status.nodeInfo.kubeletVersion}",
-			)
-			Expect(err).NotTo(HaveOccurred())
-			for _, v := range strings.Fields(nodesVersion) {
-				log.Printf("[k8s-upgrade] node kubelet version: %s", v)
-				Expect(v).To(Equal(cfg.K8sToVersion), "kubelet should be on %s", cfg.K8sToVersion)
+			Expect(k8sClient.List(ctx, &nodes)).To(Succeed())
+			for _, node := range nodes.Items {
+				log.Printf("[k8s-upgrade] node %s kubelet: %s", node.Name, node.Status.NodeInfo.KubeletVersion)
+				Expect(node.Status.NodeInfo.KubeletVersion).To(Equal(cfg.K8sToVersion),
+					"kubelet on %s should be %s", node.Name, cfg.K8sToVersion)
 			}
 
 			By("Verifying status details")
-			status, err := getCRStatus(ctx, talosCluster.Kubeconfig, "kubernetesupgrade", "e2e-k8s-upgrade")
-			Expect(err).NotTo(HaveOccurred())
-
-			phase, _ := status["phase"].(string)
-			Expect(phase).To(Equal("Completed"))
-
-			lastError, _ := status["lastError"].(string)
-			Expect(lastError).To(BeEmpty(), "should have no error")
+			var ku tupprv1alpha1.KubernetesUpgrade
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(upgrade), &ku)).To(Succeed())
+			Expect(ku.Status.Phase).To(Equal("Completed"))
+			Expect(ku.Status.LastError).To(BeEmpty(), "should have no error")
 
 			log.Printf("[k8s-upgrade] upgrade completed successfully")
 		}, NodeTimeout(20*time.Minute))
