@@ -111,6 +111,7 @@ func DeployController(ctx context.Context, kubeconfig string, image string, talo
 		"--set", fmt.Sprintf("image.repository=%s", repo),
 		"--set", fmt.Sprintf("image.tag=%s", tag),
 		"--set", "image.pullPolicy=Always",
+		"--set", "replicaCount=2",
 		"--wait",
 		"--timeout", controllerReadyTimeout.String(),
 		"--kubeconfig", kubeconfig,

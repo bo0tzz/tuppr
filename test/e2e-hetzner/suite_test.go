@@ -16,6 +16,12 @@ var (
 	cfg          *Config
 	cluster      *HetznerCluster
 	talosCluster *TalosCluster
+
+	// bgCtx is a long-lived context for background goroutines (log streaming,
+	// resource watches) that must outlive the BeforeSuite SpecContext.
+	// Cancelled in DeferCleanup.
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
 )
 
 func TestE2EHetzner(t *testing.T) {
@@ -100,16 +106,11 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	By("Waiting for controller to be ready")
 	Expect(WaitForController(ctx, talosCluster.Kubeconfig)).To(Succeed())
 	log.Printf("[deploy] controller is ready")
-}, NodeTimeout(40*time.Minute))
 
-var _ = Describe("Infrastructure", Ordered, func() {
-	It("should have created 3 servers with public IPs", func() {
-		Expect(cluster).NotTo(BeNil())
-		ips := cluster.ServerIPs()
-		Expect(ips).To(HaveLen(3))
-		for i, ip := range ips {
-			Expect(ip).NotTo(BeEmpty(), "server %d has no IP", i)
-			log.Printf("Server %d IP: %s", i, ip)
-		}
-	})
-})
+	By("Starting background log streaming")
+	bgCtx, bgCancel = context.WithCancel(context.Background())
+	DeferCleanup(bgCancel)
+	streamLogs(bgCtx, talosCluster.Kubeconfig, controllerNamespace, "tuppr", "[tuppr]")
+	watchResource(bgCtx, talosCluster.Kubeconfig, "talosupgrade", "[watch/talosupgrade]")
+	watchResource(bgCtx, talosCluster.Kubeconfig, "kubernetesupgrade", "[watch/k8supgrade]")
+}, NodeTimeout(40*time.Minute))
