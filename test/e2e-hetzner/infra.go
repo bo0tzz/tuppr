@@ -254,13 +254,19 @@ func (h *HetznerCluster) flashTalos(ctx context.Context, ip string) error {
 		Timeout:         10 * time.Second,
 	}
 
-	client, err := ssh.Dial("tcp", ip+":22", sshConfig)
+	sshClient, err := ssh.Dial("tcp", ip+":22", sshConfig)
 	if err != nil {
 		return fmt.Errorf("SSH dial to %s: %w", ip, err)
 	}
-	defer client.Close()
+	defer sshClient.Close()
 
-	session, err := client.NewSession()
+	// Close the SSH connection if the context is cancelled (e.g. ctrl+c)
+	go func() {
+		<-ctx.Done()
+		sshClient.Close()
+	}()
+
+	session, err := sshClient.NewSession()
 	if err != nil {
 		return fmt.Errorf("SSH session: %w", err)
 	}
@@ -275,6 +281,10 @@ func (h *HetznerCluster) flashTalos(ctx context.Context, ip string) error {
 	cmd := fmt.Sprintf("curl -fsSL %s | xz -d | dd of=/dev/sda bs=4M && sync", imageURL)
 	output, err := session.CombinedOutput(cmd)
 	if err != nil {
+		// Distinguish context cancellation from real failures
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("flash command failed: %w\nOutput: %s", err, string(output))
 	}
 
