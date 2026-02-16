@@ -27,7 +27,6 @@ const (
 	dialTimeout           = 5 * time.Second
 )
 
-// TalosCluster manages a Talos Linux cluster bootstrapped via talosctl.
 type TalosCluster struct {
 	Name         string
 	TalosVersion string // e.g. "v1.11.0" — config contract compatibility
@@ -38,7 +37,6 @@ type TalosCluster struct {
 	Kubeconfig   string // path to kubeconfig file
 }
 
-// NewTalosCluster creates a new TalosCluster manager.
 func NewTalosCluster(name string, talosVersion string, k8sVersion string, ips []string) (*TalosCluster, error) {
 	dir, err := os.MkdirTemp("", "tuppr-e2e-talos-*")
 	if err != nil {
@@ -53,8 +51,6 @@ func NewTalosCluster(name string, talosVersion string, k8sVersion string, ips []
 	}, nil
 }
 
-// Bootstrap generates configs, applies them to each node, and bootstraps
-// the Talos cluster. After this returns, Kubernetes should be accessible.
 func (tc *TalosCluster) Bootstrap(ctx context.Context) error {
 	if err := tc.genConfig(ctx); err != nil {
 		return fmt.Errorf("generating config: %w", err)
@@ -95,7 +91,6 @@ func (tc *TalosCluster) Bootstrap(ctx context.Context) error {
 	return nil
 }
 
-// Cleanup removes the temporary config directory.
 func (tc *TalosCluster) Cleanup() {
 	if tc.ConfigDir != "" {
 		os.RemoveAll(tc.ConfigDir)
@@ -105,16 +100,12 @@ func (tc *TalosCluster) Cleanup() {
 func (tc *TalosCluster) genConfig(ctx context.Context) error {
 	endpoint := fmt.Sprintf("https://%s:6443", tc.ServerIPs[0])
 
-	// Build config patches — each must be passed as a separate --config-patch
-	// flag (a JSON array is interpreted as JSON6902 which isn't supported).
 	patches := []map[string]any{
-		// Allow scheduling on control plane nodes (we only have control planes)
 		{
 			"cluster": map[string]any{
 				"allowSchedulingOnControlPlanes": true,
 			},
 		},
-		// Enable Kubernetes Talos API access for the tuppr controller
 		{
 			"machine": map[string]any{
 				"features": map[string]any{
@@ -155,7 +146,6 @@ func (tc *TalosCluster) genConfig(ctx context.Context) error {
 
 	tc.TalosConfig = filepath.Join(tc.ConfigDir, "talosconfig")
 
-	// Set real endpoints in the talosconfig (gen config defaults to 127.0.0.1)
 	endpointArgs := append([]string{"config", "endpoint"}, tc.ServerIPs...)
 	if err := tc.talosctlWithConfig(ctx, endpointArgs...); err != nil {
 		return fmt.Errorf("setting endpoints: %w", err)
@@ -170,8 +160,6 @@ func (tc *TalosCluster) genConfig(ctx context.Context) error {
 func (tc *TalosCluster) applyConfig(ctx context.Context, index int, ip string) error {
 	configFile := filepath.Join(tc.ConfigDir, "controlplane.yaml")
 
-	// Set a unique hostname per node (must be a JSON object, not array,
-	// to be detected as a strategic merge patch instead of JSON6902)
 	hostnamePatch := fmt.Sprintf(`{"machine": {"network": {"hostname": "%s-node-%d"}}}`, tc.Name, index)
 
 	return tc.talosctl(ctx,
@@ -187,8 +175,6 @@ func (tc *TalosCluster) waitForKubernetesReady(ctx context.Context) error {
 	deadline, cancel := context.WithTimeout(ctx, talosBootstrapTimeout)
 	defer cancel()
 
-	// Use talosctl health to wait for the cluster to converge.
-	// This waits for etcd, Kubernetes API, and all nodes to be healthy.
 	endpoints := strings.Join(tc.ServerIPs, ",")
 	return tc.talosctlWithConfig(deadline,
 		"health",
@@ -284,7 +270,6 @@ func (tc *TalosCluster) allNodesReady(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// talosctl runs a talosctl command without any config file (for pre-bootstrap commands).
 func (tc *TalosCluster) talosctl(ctx context.Context, args ...string) error {
 	log.Printf("[talos] talosctl %s", strings.Join(args, " "))
 	cmd := exec.CommandContext(ctx, "talosctl", args...)
@@ -299,8 +284,49 @@ func (tc *TalosCluster) talosctl(ctx context.Context, args ...string) error {
 	return nil
 }
 
-// talosctlWithConfig runs a talosctl command using the generated talosconfig.
 func (tc *TalosCluster) talosctlWithConfig(ctx context.Context, args ...string) error {
 	fullArgs := append([]string{"--talosconfig", tc.TalosConfig}, args...)
 	return tc.talosctl(ctx, fullArgs...)
+}
+
+func (tc *TalosCluster) talosctlOutput(ctx context.Context, args ...string) (string, error) {
+	fullArgs := append([]string{"--talosconfig", tc.TalosConfig}, args...)
+	cmd := exec.CommandContext(ctx, "talosctl", fullArgs...)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("talosctl %s: %w\nstderr: %s", args[0], err, string(ee.Stderr))
+		}
+		return "", fmt.Errorf("talosctl %s: %w", args[0], err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (tc *TalosCluster) NodeVersions(ctx context.Context) (map[string]string, error) {
+	versions := make(map[string]string, len(tc.ServerIPs))
+	for _, ip := range tc.ServerIPs {
+		out, err := tc.talosctlOutput(ctx, "version", "--nodes", ip, "--short")
+		if err != nil {
+			return nil, fmt.Errorf("getting version for %s: %w", ip, err)
+		}
+		// talosctl version --short outputs:
+		//   Client:
+		//     Tag: v1.12.4
+		//   Server:
+		//     Tag: v1.11.0
+		// We want the server tag (the last "Tag:" line).
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Tag:") {
+				versions[ip] = strings.TrimSpace(strings.TrimPrefix(line, "Tag:"))
+			}
+		}
+		if _, ok := versions[ip]; !ok {
+			return nil, fmt.Errorf("could not parse Talos version for %s from:\n%s", ip, out)
+		}
+	}
+	return versions, nil
 }

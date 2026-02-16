@@ -20,9 +20,6 @@ var (
 	talosCluster *TalosCluster
 	k8sClient    client.WithWatch
 
-	// bgCtx is a long-lived context for background goroutines (log streaming,
-	// resource watches) that must outlive the BeforeSuite SpecContext.
-	// Cancelled in DeferCleanup.
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 )
@@ -32,9 +29,6 @@ func TestE2EHetzner(t *testing.T) {
 	RunSpecs(t, "E2E Hetzner Suite")
 }
 
-// BeforeSuite accepts SpecContext which is automatically cancelled by Ginkgo on
-// interrupt (ctrl+c). This ensures all in-flight API calls and SSH sessions
-// are terminated promptly so DeferCleanup can run Destroy.
 var _ = BeforeSuite(func(ctx SpecContext) {
 	var err error
 
@@ -48,8 +42,6 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	By("Creating Hetzner cluster")
 	cluster = NewHetznerCluster(cfg)
 
-	// Ensure cleanup runs even if Create fails partway through.
-	// Uses a fresh context since the spec context will be cancelled by then.
 	DeferCleanup(func() {
 		if cluster == nil {
 			return
@@ -80,7 +72,6 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 		}
 	})
 
-	// Run bootstrap and image build concurrently — they're independent.
 	type imageResult struct {
 		image string
 		err   error

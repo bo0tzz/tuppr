@@ -8,7 +8,6 @@ import (
 	"os/exec"
 )
 
-// Config holds all configuration for the e2e test run.
 type Config struct {
 	HCloudToken      string
 	ServerType       string
@@ -20,7 +19,6 @@ type Config struct {
 	ControllerImage  string // if set, skip build and use this image
 }
 
-// LoadConfig reads configuration from environment variables.
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
 		HCloudToken:      os.Getenv("HCLOUD_TOKEN"),
@@ -40,7 +38,6 @@ func LoadConfig() (*Config, error) {
 	return cfg, nil
 }
 
-// CheckPrerequisites verifies that all required CLI tools are available.
 func CheckPrerequisites() error {
 	tools := []string{"talosctl", "helm", "docker"}
 	for _, tool := range tools {

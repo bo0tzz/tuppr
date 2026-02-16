@@ -26,7 +26,6 @@ const (
 	connectTimeout = 5 * time.Minute
 )
 
-// HetznerCluster manages the lifecycle of Hetzner Cloud VMs for e2e testing.
 type HetznerCluster struct {
 	client     *hcloud.Client
 	config     *Config
@@ -36,7 +35,6 @@ type HetznerCluster struct {
 	servers    []*hcloud.Server
 }
 
-// NewHetznerCluster creates a new cluster manager.
 func NewHetznerCluster(cfg *Config) *HetznerCluster {
 	runID := fmt.Sprintf("tuppr-e2e-%d", time.Now().Unix())
 	if ghaRunID := os.Getenv("GITHUB_RUN_ID"); ghaRunID != "" {
@@ -49,8 +47,6 @@ func NewHetznerCluster(cfg *Config) *HetznerCluster {
 	}
 }
 
-// Create provisions VMs, flashes Talos, and reboots into Talos.
-// All servers are provisioned concurrently.
 func (h *HetznerCluster) Create(ctx context.Context) error {
 	if err := h.createSSHKey(ctx); err != nil {
 		return fmt.Errorf("creating SSH key: %w", err)
@@ -77,7 +73,6 @@ func (h *HetznerCluster) Create(ctx context.Context) error {
 	return nil
 }
 
-// Destroy tears down all Hetzner resources (servers + SSH key).
 func (h *HetznerCluster) Destroy(ctx context.Context) error {
 	var errs []error
 
@@ -104,7 +99,6 @@ func (h *HetznerCluster) Destroy(ctx context.Context) error {
 	return nil
 }
 
-// ServerIPs returns the public IPv4 addresses of all servers.
 func (h *HetznerCluster) ServerIPs() []string {
 	ips := make([]string, len(h.servers))
 	for i, s := range h.servers {
@@ -149,7 +143,6 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) er
 
 	h.logf("%s: creating server (type=%s, location=%s)", name, h.config.ServerType, h.config.Location)
 
-	// Create server with any Linux image (we'll overwrite the disk)
 	result, _, err := h.client.Server.Create(ctx, hcloud.ServerCreateOpts{
 		Name:       name,
 		ServerType: &hcloud.ServerType{Name: h.config.ServerType},
@@ -163,13 +156,11 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) er
 	}
 
 	server := result.Server
-	// Store reference immediately so Destroy can clean up even if flash is interrupted
 	h.servers[index] = server
 
 	ip := server.PublicNet.IPv4.IP.String()
 	h.logf("%s: server created (ip=%s), waiting for actions", name, ip)
 
-	// Wait for creation action to complete
 	if err := h.client.Action.WaitFor(ctx, result.Action); err != nil {
 		return fmt.Errorf("waiting for server %s creation: %w", name, err)
 	}
@@ -260,7 +251,6 @@ func (h *HetznerCluster) flashTalos(ctx context.Context, ip string) error {
 	}
 	defer sshClient.Close()
 
-	// Close the SSH connection if the context is cancelled (e.g. ctrl+c)
 	go func() {
 		<-ctx.Done()
 		sshClient.Close()
@@ -281,7 +271,6 @@ func (h *HetznerCluster) flashTalos(ctx context.Context, ip string) error {
 	cmd := fmt.Sprintf("curl -fsSL %s | xz -d | dd of=/dev/sda bs=4M && sync", imageURL)
 	output, err := session.CombinedOutput(cmd)
 	if err != nil {
-		// Distinguish context cancellation from real failures
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

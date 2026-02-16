@@ -27,7 +27,6 @@ const (
 	controllerReadyTimeout = 5 * time.Minute
 )
 
-// BuildAndPushImage builds the controller image and pushes it to ttl.sh.
 func BuildAndPushImage(ctx context.Context, cfg *Config, runID string) (string, error) {
 	if cfg.ControllerImage != "" {
 		log.Printf("[deploy] using pre-built image: %s", cfg.ControllerImage)
@@ -67,9 +66,6 @@ func BuildAndPushImage(ctx context.Context, cfg *Config, runID string) (string, 
 	return image, nil
 }
 
-// DeployController installs the controller via Helm.
-// CRDs are applied directly from config/crd/bases/, and the talosconfig
-// secret is auto-created by Talos via the ServiceAccount in the chart.
 func DeployController(ctx context.Context, c client.Client, kubeconfig, image string) error {
 	repoRoot, err := repoRootDir()
 	if err != nil {
@@ -131,7 +127,6 @@ func DeployController(ctx context.Context, c client.Client, kubeconfig, image st
 	return nil
 }
 
-// WaitForController waits for the controller deployment to be fully ready.
 func WaitForController(ctx context.Context, c client.Client) error {
 	return waitForDeploymentReady(ctx, c, controllerNamespace, "tuppr", controllerReadyTimeout)
 }

@@ -22,13 +22,11 @@ const (
 	upgradePollInterval = 30 * time.Second
 )
 
-// Upgrades run in a single Ordered container to ensure TalosUpgrade completes
-// before KubernetesUpgrade starts (K8s v1.35 requires Talos v1.12).
 var _ = Describe("Upgrades", Ordered, func() {
 	Describe("TalosUpgrade", func() {
 		It("should upgrade all nodes to the target Talos version", func(ctx SpecContext) {
 			By("Verifying all nodes are on the initial Talos version")
-			versions, err := getTalosNodeVersions(ctx, talosCluster.TalosConfig, talosCluster.ServerIPs)
+			versions, err := talosCluster.NodeVersions(ctx)
 			Expect(err).NotTo(HaveOccurred())
 			for ip, v := range versions {
 				log.Printf("[talos-upgrade] node %s: %s", ip, v)
@@ -63,7 +61,7 @@ var _ = Describe("Upgrades", Ordered, func() {
 			}, talosUpgradeTimeout, upgradePollInterval).Should(Succeed())
 
 			By("Verifying all nodes are on the target Talos version")
-			versions, err = getTalosNodeVersions(ctx, talosCluster.TalosConfig, talosCluster.ServerIPs)
+			versions, err = talosCluster.NodeVersions(ctx)
 			Expect(err).NotTo(HaveOccurred())
 			for ip, v := range versions {
 				log.Printf("[talos-upgrade] node %s: %s", ip, v)

@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -23,26 +22,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// talosctlOutput runs talosctl with the given talosconfig and returns stdout.
-func talosctlOutput(ctx context.Context, talosconfig string, args ...string) (string, error) {
-	fullArgs := append([]string{"--talosconfig", talosconfig}, args...)
-	cmd := exec.CommandContext(ctx, "talosctl", fullArgs...)
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("talosctl %s: %w\nstderr: %s", args[0], err, string(ee.Stderr))
-		}
-		return "", fmt.Errorf("talosctl %s: %w", args[0], err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// streamLogs watches for pods matching a deployment's selector and streams logs
-// from every pod. New pods (e.g. after leader election changes) are picked up
-// automatically. Restarts the pod watcher if it disconnects.
+// streamLogs streams logs from every pod matching a deployment's selector.
+// New pods (e.g. after leader changes) are picked up automatically.
 func streamLogs(ctx context.Context, kubeconfig, namespace, deployment, prefix string) {
 	go func() {
 		for ctx.Err() == nil {
@@ -79,7 +60,6 @@ func runStreamLogs(ctx context.Context, kubeconfig, namespace, deployment, prefi
 
 	selector := labelSelector(dep.Spec.Selector.MatchLabels)
 
-	// Track which pods we're already streaming so we don't double-stream.
 	var mu sync.Mutex
 	streaming := map[string]context.CancelFunc{}
 
@@ -111,7 +91,6 @@ func runStreamLogs(ctx context.Context, kubeconfig, namespace, deployment, prefi
 		}
 	}
 
-	// Start streaming existing pods.
 	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: selector,
 	})
@@ -122,7 +101,6 @@ func runStreamLogs(ctx context.Context, kubeconfig, namespace, deployment, prefi
 		startStream(pod)
 	}
 
-	// Watch for new/deleted pods.
 	watcher, err := clientset.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
 		LabelSelector: selector,
 		ResourceVersion: pods.ResourceVersion,
@@ -178,8 +156,6 @@ func labelSelector(labels map[string]string) string {
 	return strings.Join(parts, ",")
 }
 
-// watchResource starts a background watch for a resource type and logs all
-// events as raw JSON. Automatically restarts if the connection drops.
 func watchResource(ctx context.Context, c client.WithWatch, list client.ObjectList, prefix string) {
 	go func() {
 		for ctx.Err() == nil {
@@ -209,8 +185,6 @@ func runWatch(ctx context.Context, c client.WithWatch, list client.ObjectList, p
 	log.Printf("%s watching started", prefix)
 	for event := range watcher.ResultChan() {
 		if event.Type == watch.Error {
-			// Watch terminated by API server (e.g. 410 Gone, context cancelled).
-			// This is normal during teardown or after long-running watches.
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -227,7 +201,6 @@ func runWatch(ctx context.Context, c client.WithWatch, list client.ObjectList, p
 	return nil
 }
 
-// waitForDeploymentReady polls until a deployment has all replicas ready.
 func waitForDeploymentReady(ctx context.Context, c client.Client, namespace, name string, timeout time.Duration) error {
 	deadline := time.After(timeout)
 	for {
@@ -251,31 +224,3 @@ func waitForDeploymentReady(ctx context.Context, c client.Client, namespace, nam
 	}
 }
 
-// getTalosNodeVersions returns a map of node IP -> Talos version string.
-func getTalosNodeVersions(ctx context.Context, talosconfig string, nodeIPs []string) (map[string]string, error) {
-	versions := make(map[string]string, len(nodeIPs))
-	for _, ip := range nodeIPs {
-		out, err := talosctlOutput(ctx, talosconfig,
-			"version", "--nodes", ip, "--short",
-		)
-		if err != nil {
-			return nil, fmt.Errorf("getting version for %s: %w", ip, err)
-		}
-		// talosctl version --short outputs:
-		//   Client:
-		//     Tag: v1.12.4
-		//   Server:
-		//     Tag: v1.11.0
-		// We want the server tag (the last "Tag:" line).
-		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "Tag:") {
-				versions[ip] = strings.TrimSpace(strings.TrimPrefix(line, "Tag:"))
-			}
-		}
-		if _, ok := versions[ip]; !ok {
-			return nil, fmt.Errorf("could not parse Talos version for %s from:\n%s", ip, out)
-		}
-	}
-	return versions, nil
-}
