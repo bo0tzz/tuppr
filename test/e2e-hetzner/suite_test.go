@@ -60,7 +60,7 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 		log.Printf("[hetzner] node %d: %s", i, ip)
 	}
 
-	By("Bootstrapping Talos cluster")
+	By("Bootstrapping Talos cluster and building controller image in parallel")
 	var err2 error
 	talosCluster, err2 = NewTalosCluster(cluster.RunID, cfg.TalosFromVersion, cfg.K8sFromVersion, cluster.ServerIPs())
 	Expect(err2).NotTo(HaveOccurred())
@@ -71,11 +71,35 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 		}
 	})
 
-	Expect(talosCluster.Bootstrap(ctx)).To(Succeed())
+	// Run bootstrap and image build concurrently — they're independent.
+	type imageResult struct {
+		image string
+		err   error
+	}
+	imageCh := make(chan imageResult, 1)
+	go func() {
+		img, err := BuildAndPushImage(ctx, cfg, cluster.RunID)
+		imageCh <- imageResult{img, err}
+	}()
 
-	By("Talos cluster bootstrapped successfully")
+	Expect(talosCluster.Bootstrap(ctx)).To(Succeed())
 	log.Printf("[talos] kubeconfig: %s", talosCluster.Kubeconfig)
 	log.Printf("[talos] talosconfig: %s", talosCluster.TalosConfig)
+
+	By("Waiting for controller image build to finish")
+	imgRes := <-imageCh
+	Expect(imgRes.err).NotTo(HaveOccurred(), "building controller image")
+	image := imgRes.image
+	log.Printf("[deploy] image: %s", image)
+
+	By("Deploying controller via Helm")
+	talosConfigData, err4 := talosCluster.TalosConfigData()
+	Expect(err4).NotTo(HaveOccurred())
+	Expect(DeployController(ctx, talosCluster.Kubeconfig, image, talosConfigData)).To(Succeed())
+
+	By("Waiting for controller to be ready")
+	Expect(WaitForController(ctx, talosCluster.Kubeconfig)).To(Succeed())
+	log.Printf("[deploy] controller is ready")
 }, NodeTimeout(40*time.Minute))
 
 var _ = Describe("Infrastructure", Ordered, func() {
