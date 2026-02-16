@@ -6,12 +6,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
-
-	"log"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	"golang.org/x/crypto/ssh"
@@ -21,8 +21,8 @@ const (
 	// defaultSchematicID is the vanilla Talos schematic (no extensions).
 	defaultSchematicID = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
 	nodeCount          = 3
-	sshRetryInterval   = 5 * time.Second
-	sshConnectTimeout  = 5 * time.Minute
+	retryInterval  = 5 * time.Second
+	connectTimeout = 5 * time.Minute
 )
 
 // HetznerCluster manages the lifecycle of Hetzner Cloud VMs for e2e testing.
@@ -66,12 +66,9 @@ func (h *HetznerCluster) Create(ctx context.Context) error {
 	}
 	wg.Wait()
 
-	for _, err := range errs {
-		if err != nil {
-			return err
-		}
+	if err := errors.Join(errs...); err != nil {
+		return err
 	}
-
 	return nil
 }
 
@@ -222,14 +219,14 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) er
 }
 
 func (h *HetznerCluster) waitForSSH(ctx context.Context, ip string) error {
-	deadline := time.After(sshConnectTimeout)
+	deadline := time.After(connectTimeout)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
-			return fmt.Errorf("SSH not available at %s after %v", ip, sshConnectTimeout)
-		case <-time.After(sshRetryInterval):
+			return fmt.Errorf("SSH not available at %s after %v", ip, connectTimeout)
+		case <-time.After(retryInterval):
 			conn, err := net.DialTimeout("tcp", ip+":22", 5*time.Second)
 			if err == nil {
 				conn.Close()

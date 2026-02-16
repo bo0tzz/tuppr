@@ -226,14 +226,14 @@ func (tc *TalosCluster) fetchKubeconfig(ctx context.Context) error {
 }
 
 func (tc *TalosCluster) waitForTalosAPI(ctx context.Context, ip string) error {
-	deadline := time.After(sshConnectTimeout)
+	deadline := time.After(connectTimeout)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
-			return fmt.Errorf("Talos API not available at %s:50000 after %v", ip, sshConnectTimeout)
-		case <-time.After(sshRetryInterval):
+			return fmt.Errorf("Talos API not available at %s:50000 after %v", ip, connectTimeout)
+		case <-time.After(retryInterval):
 			conn, err := net.DialTimeout("tcp", ip+":50000", 5*time.Second)
 			if err == nil {
 				conn.Close()
