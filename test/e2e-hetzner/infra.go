@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	ginkgo "github.com/onsi/ginkgo/v2"
+
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	"golang.org/x/crypto/ssh"
 )
@@ -84,12 +86,14 @@ func (h *HetznerCluster) Destroy(ctx context.Context) error {
 		if server == nil {
 			continue
 		}
+		h.logf("deleting server %s", server.Name)
 		if _, err := h.client.Server.Delete(ctx, server); err != nil {
 			errs = append(errs, fmt.Errorf("deleting server %s: %w", server.Name, err))
 		}
 	}
 
 	if h.sshKey != nil {
+		h.logf("deleting SSH key %s", h.sshKey.Name)
 		if _, err := h.client.SSHKey.Delete(ctx, h.sshKey); err != nil {
 			errs = append(errs, fmt.Errorf("deleting SSH key: %w", err))
 		}
@@ -137,8 +141,14 @@ func (h *HetznerCluster) createSSHKey(ctx context.Context) error {
 	return nil
 }
 
+func (h *HetznerCluster) logf(format string, args ...any) {
+	fmt.Fprintf(ginkgo.GinkgoWriter, "[hetzner] "+format+"\n", args...)
+}
+
 func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*hcloud.Server, error) {
 	name := fmt.Sprintf("%s-node-%d", h.RunID, index)
+
+	h.logf("%s: creating server (type=%s, location=%s)", name, h.config.ServerType, h.config.Location)
 
 	// Create server with any Linux image (we'll overwrite the disk)
 	result, _, err := h.client.Server.Create(ctx, hcloud.ServerCreateOpts{
@@ -154,6 +164,8 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*
 	}
 
 	server := result.Server
+	ip := server.PublicNet.IPv4.IP.String()
+	h.logf("%s: server created (ip=%s), waiting for actions", name, ip)
 
 	// Wait for creation action to complete
 	if err := h.client.Action.WaitFor(ctx, result.Action); err != nil {
@@ -165,7 +177,7 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*
 		}
 	}
 
-	// Enable rescue mode
+	h.logf("%s: enabling rescue mode", name)
 	rescueResult, _, err := h.client.Server.EnableRescue(ctx, server, hcloud.ServerEnableRescueOpts{
 		Type:    hcloud.ServerRescueTypeLinux64,
 		SSHKeys: []*hcloud.SSHKey{h.sshKey},
@@ -177,7 +189,7 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*
 		return nil, fmt.Errorf("waiting for rescue enable on %s: %w", name, err)
 	}
 
-	// Reset server to boot into rescue
+	h.logf("%s: resetting server to boot into rescue", name)
 	resetAction, _, err := h.client.Server.Reset(ctx, server)
 	if err != nil {
 		return nil, fmt.Errorf("resetting %s for rescue: %w", name, err)
@@ -186,18 +198,17 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*
 		return nil, fmt.Errorf("waiting for reset on %s: %w", name, err)
 	}
 
-	// Wait for SSH in rescue mode
-	ip := server.PublicNet.IPv4.IP.String()
+	h.logf("%s: waiting for SSH on %s", name, ip)
 	if err := h.waitForSSH(ctx, ip); err != nil {
 		return nil, fmt.Errorf("waiting for SSH on %s (%s): %w", name, ip, err)
 	}
 
-	// Flash Talos image
+	h.logf("%s: flashing Talos %s (this takes 2-5 minutes)", name, h.config.TalosFromVersion)
 	if err := h.flashTalos(ctx, ip); err != nil {
 		return nil, fmt.Errorf("flashing Talos on %s (%s): %w", name, ip, err)
 	}
 
-	// Reboot into Talos
+	h.logf("%s: flash complete, rebooting into Talos", name)
 	rebootAction, _, err := h.client.Server.Reset(ctx, server)
 	if err != nil {
 		return nil, fmt.Errorf("rebooting %s into Talos: %w", name, err)
@@ -206,6 +217,7 @@ func (h *HetznerCluster) createAndFlashServer(ctx context.Context, index int) (*
 		return nil, fmt.Errorf("waiting for Talos reboot on %s: %w", name, err)
 	}
 
+	h.logf("%s: ready (ip=%s)", name, ip)
 	return server, nil
 }
 
