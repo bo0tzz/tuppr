@@ -24,7 +24,7 @@ func LoadConfig() (*Config, error) {
 	cfg := &Config{
 		HCloudToken:      os.Getenv("HCLOUD_TOKEN"),
 		ServerType:       envOrDefault("HCLOUD_SERVER_TYPE", "cx23"),
-		Location:         envOrDefault("HCLOUD_LOCATION", "fsn1"),
+		Location:         envOrDefault("HCLOUD_LOCATION", "nbg1"),
 		TalosFromVersion: envOrDefault("TALOS_FROM_VERSION", "v1.11.0"),
 		TalosToVersion:   envOrDefault("TALOS_TO_VERSION", "v1.12.4"),
 		K8sToVersion:     envOrDefault("K8S_TO_VERSION", "v1.34.0"),
