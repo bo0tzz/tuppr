@@ -53,7 +53,7 @@ variable "k8s_bootstrap_version" {
 variable "k8s_upgrade_version" {
   description = "Target Kubernetes version for upgrade testing"
   type        = string
-  default     = "v1.35.0"
+  default     = "v1.35.1"
 }
 
 variable "server_type" {
